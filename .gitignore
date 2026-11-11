@@ -1,0 +1,8 @@
+# build output
+/pod-frozenlock-bbolt
+/pod-frozenlock-bbolt.exe
+/dist/
+
+# test scratch
+*.db
+*.db.lock

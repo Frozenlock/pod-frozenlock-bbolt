@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+#
+# Build the pod, run its Go tests, then exercise it over the pod protocol.
+#
+# The Go tests call the internals directly; test/script.clj loads the built
+# binary as a pod and talks to it over bencode, which is the only thing that
+# catches a var declared in `describe` but missing from the dispatch switch.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+go build -o pod-frozenlock-bbolt .
+go test ./...
+
+# Windows will not exec a PE file without the extension, and `go build -o`
+# uses the name verbatim rather than appending `.exe`.
+bin=./pod-frozenlock-bbolt
+if [[ "${OS:-}" == "Windows_NT" ]]; then
+  mv pod-frozenlock-bbolt pod-frozenlock-bbolt.exe
+  bin=./pod-frozenlock-bbolt.exe
+fi
+
+POD_BBOLT="$bin" bb test/script.clj

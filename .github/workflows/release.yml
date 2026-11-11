@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  # goreleaser creates the GitHub release and uploads the archives.
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # goreleaser builds the changelog from the commit history; a shallow
+          # clone makes it fail.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: DeLaGuardo/setup-clojure@13
+        with:
+          bb: latest
+
+      # A tag must not publish a broken build.
+      - name: test
+        run: script/test
+
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: '~> v2'
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The registry has no CI and no validation: a 404 in the manifest is
+      # only discovered by whoever tries to load the pod. Check it here, while
+      # the release is still fresh.
+      - name: verify the manifest URLs resolve
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          manifest_version=$(grep -o ':pod/version *"[^"]*"' registry/manifest.edn \
+                             | grep -o '[0-9][^"]*')
+          echo "tag $version, manifest $manifest_version"
+          [ "$version" = "$manifest_version" ] || {
+            echo "::error::tag $version does not match the manifest's $manifest_version"
+            exit 1
+          }
+          grep -o 'https://github.com/[^"]*\.zip' registry/manifest.edn \
+            | while read -r url; do
+                code=$(curl -s -o /dev/null -w '%{http_code}' -L "$url")
+                echo "$code $url"
+                [ "$code" = "200" ] || { echo "::error::$url is $code"; exit 1; }
+              done

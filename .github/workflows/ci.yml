@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not cancel the others: the point of the
+      # matrix is to learn WHICH platforms are broken.
+      fail-fast: false
+      matrix:
+        # Mirrors the release matrix in .goreleaser.yml. `macos-latest` is
+        # arm64, so Intel macOS needs its own label.
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - windows-latest
+          - windows-11-arm
+          - macos-15-intel
+          - macos-latest
+    defaults:
+      run:
+        # script/test is bash; Windows defaults to PowerShell.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: DeLaGuardo/setup-clojure@13
+        with:
+          bb: latest
+
+      # Formatting is a build failure, not a nit. Once is enough.
+      - name: gofmt
+        if: runner.os == 'Linux'
+        run: test -z "$(gofmt -l .)"
+
+      - name: go vet
+        run: go vet ./...
+
+      # Builds, runs the Go tests, then the protocol suite over bencode.
+      - name: test
+        run: script/test
