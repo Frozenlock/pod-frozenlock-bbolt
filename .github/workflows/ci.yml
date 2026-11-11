@@ -19,13 +19,17 @@ jobs:
       matrix:
         # Mirrors the release matrix in .goreleaser.yml. `macos-latest` is
         # arm64, so Intel macOS needs its own label.
-        os:
-          - ubuntu-latest
-          - ubuntu-24.04-arm
-          - windows-latest
-          - windows-11-arm
-          - macos-15-intel
-          - macos-latest
+        include:
+          - { os: ubuntu-latest,    bb: native }
+          - { os: ubuntu-24.04-arm, bb: native }
+          - { os: windows-latest,   bb: native }
+          # Babashka publishes no windows-arm64 build, and setup-clojure asks
+          # for `babashka-<v>-windows-aarch64.zip` unconditionally. Windows 11
+          # ARM emulates x64, so the amd64 babashka drives the native arm64
+          # pod just fine.
+          - { os: windows-11-arm,   bb: amd64 }
+          - { os: macos-15-intel,   bb: native }
+          - { os: macos-latest,     bb: native }
     defaults:
       run:
         # script/test is bash; Windows defaults to PowerShell.
@@ -37,9 +41,23 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - uses: DeLaGuardo/setup-clojure@13
+      - name: setup babashka
+        if: matrix.bb == 'native'
+        uses: DeLaGuardo/setup-clojure@13
         with:
           bb: latest
+
+      - name: setup babashka (x64, emulated)
+        if: matrix.bb == 'amd64'
+        run: |
+          set -euo pipefail
+          version=$(curl -s https://api.github.com/repos/babashka/babashka/releases/latest \
+                    | grep -o '"tag_name": *"v[^"]*"' | grep -o '[0-9][^"]*')
+          echo "babashka $version (windows-amd64)"
+          curl -sL -o bb.zip \
+            "https://github.com/babashka/babashka/releases/download/v${version}/babashka-${version}-windows-amd64.zip"
+          unzip -q bb.zip -d bb
+          echo "$PWD/bb" >> "$GITHUB_PATH"
 
       # Formatting is a build failure, not a nit. Once is enough.
       - name: gofmt
