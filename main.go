@@ -66,12 +66,17 @@ type dbRef struct {
 }
 
 type pod struct {
-	mu     sync.Mutex
-	dbs    map[string]*bolt.DB
-	paths  map[string]*dbRef
-	openMu map[string]*sync.Mutex
-	txs    map[string]*txRec
-	seq    int64
+	mu sync.Mutex
+	// closeMu is held for writing while a *bolt.DB is closed or swapped, and
+	// for reading across `begin`. Without it a transaction can be created
+	// between the closer's rollback sweep and its Close, which then waits
+	// forever for a transaction it never saw. Lock order: closeMu, then mu.
+	closeMu sync.RWMutex
+	dbs     map[string]*bolt.DB
+	paths   map[string]*dbRef
+	openMu  map[string]*sync.Mutex
+	txs     map[string]*txRec
+	seq     int64
 }
 
 func newPod() *pod {
@@ -360,6 +365,9 @@ func (p *pod) open(args []interface{}) (interface{}, error) {
 
 func (p *pod) close(args []interface{}) (interface{}, error) {
 	h := str(args, 0)
+	// No begin may be in flight while we sweep and close.
+	p.closeMu.Lock()
+	defer p.closeMu.Unlock()
 	p.mu.Lock()
 	db, ok := p.dbs[h]
 	if !ok {
@@ -413,6 +421,11 @@ func (p *pod) beginOn(handle string, db *bolt.DB, writable bool) (*bolt.Tx, *bol
 
 func (p *pod) begin(args []interface{}, writable bool) (interface{}, error) {
 	handle := str(args, 0)
+	// Held across the whole begin: the transaction must be registered before a
+	// concurrent close/compact sweeps for open transactions, or Close blocks on
+	// one it cannot see.
+	p.closeMu.RLock()
+	defer p.closeMu.RUnlock()
 	db, err := p.db(handle)
 	if err != nil {
 		return nil, err
@@ -1539,6 +1552,11 @@ func fileSize(path string) int64 {
 // replaced underneath them.
 func (p *pod) compact(args []interface{}) (interface{}, error) {
 	handle := str(args, 0)
+
+	// Held for the whole compaction: no transaction may begin between the
+	// rollback sweep and Close, or Close waits for one it never saw.
+	p.closeMu.Lock()
+	defer p.closeMu.Unlock()
 
 	p.mu.Lock()
 	db, ok := p.dbs[handle]
