@@ -25,3 +25,10 @@ Fixed before the first release:
   values that did not fit were silently truncated, dropping fields on read.
   They are now rejected before the write.
 - Envelopes written under the earlier `DRS1` marker still decode.
+- `count` reported the last COMMITTED state inside a write transaction: it used
+  `Bucket.Stats().KeyN`, which walks the on-disk pages, and pages are only
+  written at commit. It returned 0 for a bucket created in the same
+  transaction, and a stale number after any put or delete. The count is now
+  kept in the bucket's `Sequence` field, maintained by every write that can
+  change the key set - so it is correct inside a transaction and O(1), where a
+  cursor walk would have been correct but O(n).

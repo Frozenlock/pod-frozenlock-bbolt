@@ -177,6 +177,98 @@
                    (is (= 0 (b/count tx "b")))
                    (is (nil? (b/get tx "b" "a"))))))))
 
+(deftest count-sees-the-transactions-own-writes
+  ;; `count` must read the transaction's own writes, not the last committed
+  ;; state. It used to use `Bucket.Stats().KeyN`, which walks the bucket's
+  ;; PAGES - and a page is only written at commit - so it reported 0 for a
+  ;; bucket created in the same transaction and a stale number after any put
+  ;; or delete.
+  (with-db
+    (fn [h]
+      (testing "a bucket created in this transaction"
+        (let [tx (b/begin h)]
+          (b/put-many tx "new" [["a" "1"] ["b" "2"] ["c" "3"]])
+          (is (= 3 (b/count tx "new")))
+          (b/commit tx)))
+      (testing "puts into an existing bucket"
+        (let [tx (b/begin h)]
+          (b/put-many tx "new" [["d" "4"] ["e" "5"]])
+          (is (= 5 (b/count tx "new")))
+          (b/commit tx)))
+      (testing "a delete"
+        (let [tx (b/begin h)]
+          (b/delete tx "new" "a")
+          (is (= 4 (b/count tx "new")))
+          (b/commit tx)))
+      (testing "and the committed state agrees"
+        (read-tx h (fn [tx] (is (= 4 (b/count tx "new")))))))))
+
+(deftest count-matches-a-cursor-walk
+  ;; The count lives in the bucket's sequence field, so every write path that
+  ;; can change the KEY SET has to keep it in sync. A cursor walk is the
+  ;; oracle: O(n), but always right.
+  (with-db
+    (fn [h]
+      (let [oracle (fn [tx bucket] (count (b/scan tx bucket nil false nil false 0)))
+            check  (fn [tx bucket label]
+                     (let [want (oracle tx bucket)
+                           got  (b/count tx bucket)]
+                       (is (= want got) (str label ": oracle " want ", count " got))))]
+        (testing "put, overwrite, and an empty value"
+          (in-tx h (fn [tx]
+                     (b/put tx "b" "a" "1")
+                     (check tx "b" "after put")
+                     (b/put tx "b" "a" "2")
+                     (check tx "b" "after overwriting a key")
+                     (b/put tx "b" "empty" "")
+                     (check tx "b" "after an empty value"))))
+        (testing "put-many, including a duplicate key in one batch"
+          (in-tx h (fn [tx]
+                     (b/put-many tx "b" [["c" "1"] ["d" "2"] ["c" "3"]])
+                     (check tx "b" "after put-many"))))
+        (testing "put-doc, small and envelope, and an envelope overwrite"
+          (in-tx h (fn [tx]
+                     (put-doc! tx "b" "small" {:id "small" :n 1})
+                     (check tx "b" "after a small put-doc")
+                     (put-doc! tx "b" "big" {:id "big" :body (big-body 5000)
+                                             :meta {:city "Springfield"}})
+                     (check tx "b" "after an envelope put-doc")
+                     (put-doc! tx "b" "big" {:id "big" :body (big-body 6000)
+                                             :meta {:city "Springfield"}})
+                     (check tx "b" "after an envelope overwrite"))))
+        (testing "put-doc-many"
+          (in-tx h (fn [tx]
+                     (b/put-doc-many tx "b" [["m1" nil nil (enc {:id "m1"})]
+                                             ["m2" nil nil (enc {:id "m2"})]])
+                     (check tx "b" "after put-doc-many"))))
+        (testing "put-field leaves the key set alone"
+          (in-tx h (fn [tx]
+                     (b/put-field tx "b" "big" (enc :meta) (enc {:city "x"}))
+                     (check tx "b" "after put-field"))))
+        (testing "delete and delete-many, including a missing key"
+          (in-tx h (fn [tx]
+                     (b/delete tx "b" "a")
+                     (check tx "b" "after delete")
+                     (b/delete tx "b" "nope")
+                     (check tx "b" "after deleting a missing key")
+                     (b/delete-many tx "b" ["c" "d" "nope"])
+                     (check tx "b" "after delete-many"))))
+        (testing "the committed state agrees"
+          (read-tx h (fn [tx] (check tx "b" "after commit"))))
+        (testing "delete-bucket then recreate resets the count"
+          (in-tx h (fn [tx]
+                     (b/delete-bucket tx "b")
+                     (b/create-bucket tx "b")
+                     (check tx "b" "after recreating the bucket")
+                     (b/put tx "b" "z" "1")
+                     (check tx "b" "after a put into the recreated bucket"))))
+        (testing "compaction preserves the count"
+          (let [before (read-tx h (fn [tx] (b/count tx "b")))]
+            (b/compact h)
+            (read-tx h (fn [tx]
+                         (is (= before (b/count tx "b")) "count survives compact")
+                         (check tx "b" "after compact")))))))))
+
 (deftest count-and-buckets
   (with-db
     (fn [h]

@@ -197,6 +197,53 @@ func flag(args []interface{}, i int) bool {
 	return i < len(args) && args[i] == true
 }
 
+// --- key counting -----------------------------------------------------------
+//
+// A bucket's `Sequence` field holds its number of keys. bbolt has no O(1)
+// count of its own: `Bucket.Stats().KeyN` walks the on-disk PAGES, so inside a
+// write transaction - where the changes are still in the in-memory node tree -
+// it reports the last committed state. A cursor walk is correct but O(n).
+//
+// The sequence is transactional metadata in the bucket header: it is rolled
+// back with the transaction, works for inline buckets, and `bolt.Compact`
+// copies it. Nothing else in this pod uses it, so it is reserved for the count.
+//
+// Every write that can change the KEY SET must go through putKey/delKey.
+// `put-field` rewrites one field inside an existing envelope and cannot.
+
+// hasKey reports whether k is present. A cursor Seek, not Get: an empty value
+// is a valid value, and Get cannot tell it from a missing key.
+func hasKey(b *bolt.Bucket, k []byte) bool {
+	ck, _ := b.Cursor().Seek(k)
+	return ck != nil && bytes.Equal(ck, k)
+}
+
+// putKey writes k/v and bumps the count when k is new.
+func putKey(b *bolt.Bucket, k, v []byte) error {
+	existed := hasKey(b, k)
+	if err := b.Put(k, v); err != nil {
+		return err
+	}
+	if existed {
+		return nil
+	}
+	return b.SetSequence(b.Sequence() + 1)
+}
+
+// delKey removes k and drops the count when k was there.
+func delKey(b *bolt.Bucket, k []byte) error {
+	if !hasKey(b, k) {
+		return nil
+	}
+	if err := b.Delete(k); err != nil {
+		return err
+	}
+	if s := b.Sequence(); s > 0 {
+		return b.SetSequence(s - 1)
+	}
+	return nil
+}
+
 // --- handles ----------------------------------------------------------------
 
 func (p *pod) db(handle string) (*bolt.DB, error) {
@@ -518,7 +565,7 @@ func (p *pod) putDoc(args []interface{}) (interface{}, error) {
 	}
 	if args[3] == nil {
 		// Small document: a plain transit value is smaller than an envelope.
-		return nil, b.Put([]byte(str(args, 2)), body)
+		return nil, putKey(b, []byte(str(args, 2)), body)
 	}
 	keys, ok := args[3].([]interface{})
 	if !ok {
@@ -564,7 +611,7 @@ func (p *pod) putDoc(args []interface{}) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	return nil, b.Put([]byte(str(args, 2)), env)
+	return nil, putKey(b, []byte(str(args, 2)), env)
 }
 
 // putDocMany is putDoc for a batch, in one round-trip.
@@ -607,7 +654,7 @@ func (p *pod) putDocMany(args []interface{}) (interface{}, error) {
 		body := []byte(str(rec, 3))
 		if rec[1] == nil {
 			// Small document: a plain transit value is smaller than an envelope.
-			if err := b.Put([]byte(key), body); err != nil {
+			if err := putKey(b, []byte(key), body); err != nil {
 				return nil, err
 			}
 			continue
@@ -649,7 +696,7 @@ func (p *pod) putDocMany(args []interface{}) (interface{}, error) {
 		if err != nil {
 			return nil, err
 		}
-		if err := b.Put([]byte(key), env); err != nil {
+		if err := putKey(b, []byte(key), env); err != nil {
 			return nil, err
 		}
 	}
@@ -729,7 +776,9 @@ func (p *pod) putField(args []interface{}) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	return nil, b.Put([]byte(key), env)
+	// The key already exists (the field was found in it), so the count is
+	// unchanged; putKey keeps every write on the same path.
+	return nil, putKey(b, []byte(key), env)
 }
 
 // getPath returns one field of a document without touching the rest.
@@ -830,7 +879,7 @@ func (p *pod) put(args []interface{}) (interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	return nil, b.Put([]byte(str(args, 2)), []byte(str(args, 3)))
+	return nil, putKey(b, []byte(str(args, 2)), []byte(str(args, 3)))
 }
 
 // putMany writes [[key value] ...] in one round-trip. Bulk loads otherwise pay
@@ -863,7 +912,7 @@ func (p *pod) putMany(args []interface{}) (interface{}, error) {
 		if !ok1 || !ok2 {
 			return nil, fmt.Errorf("put-many expects string keys and values")
 		}
-		if err := b.Put([]byte(k), []byte(v)); err != nil {
+		if err := putKey(b, []byte(k), []byte(v)); err != nil {
 			return nil, err
 		}
 	}
@@ -894,7 +943,7 @@ func (p *pod) deleteMany(args []interface{}) (interface{}, error) {
 		if !ok {
 			return nil, fmt.Errorf("delete-many expects string keys")
 		}
-		if err := b.Delete([]byte(ks)); err != nil {
+		if err := delKey(b, []byte(ks)); err != nil {
 			return nil, err
 		}
 	}
@@ -912,7 +961,7 @@ func (p *pod) del(args []interface{}) (interface{}, error) {
 	if b == nil {
 		return nil, nil
 	}
-	return nil, b.Delete([]byte(str(args, 2)))
+	return nil, delKey(b, []byte(str(args, 2)))
 }
 
 // --- direct JSON encoding ---------------------------------------------------
@@ -1411,7 +1460,12 @@ func (p *pod) count(args []interface{}) (interface{}, error) {
 		if b == nil {
 			return 0, nil
 		}
-		return b.Stats().KeyN, nil
+		// The bucket's sequence field is its key count, maintained by
+		// putKey/delKey. `Stats().KeyN` cannot be used: it walks the on-disk
+		// pages, so inside a write transaction - where the changes are still
+		// in the in-memory node tree - it reports the last committed state.
+		// A cursor walk is correct but O(n).
+		return b.Sequence(), nil
 	})
 }
 
