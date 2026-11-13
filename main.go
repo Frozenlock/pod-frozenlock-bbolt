@@ -30,7 +30,7 @@ const ns = "pod.frozenlock.bbolt"
 // version is the pod's own version, reported by the `version` var so a client
 // can check what it is talking to at run time. It is kept in step with the git
 // tag and the pod-registry manifest by the release script.
-const version = "0.1.2"
+const version = "0.1.3"
 
 // Bulk-load page fill. bbolt splits a page when it is half full by default,
 // which for a sequential load means every page is written twice and the file
@@ -289,7 +289,7 @@ func (p *pod) db(handle string) (*bolt.DB, error) {
 // begin a write one would let two read-modify-write transactions read the same
 // value and lose an update. Reads that are not in a transaction go through
 // `withTx`, which uses `db.View` and so never takes the writer slot.
-func (p *pod) tx(id string) (*bolt.Tx, error) {
+func (p *pod) tx(id string) (tx *bolt.Tx, err error) {
 	p.mu.Lock()
 	rec, ok := p.txs[id]
 	p.mu.Unlock()
@@ -302,14 +302,11 @@ func (p *pod) tx(id string) (*bolt.Tx, error) {
 		return nil, fmt.Errorf("no such transaction: %s", id)
 	}
 
-	// Held across the begin, like `begin`: a compaction holds closeMu for its
-	// whole run and closes the database, so a transaction that began under it
-	// would be closed out from under the caller.
-	p.closeMu.RLock()
-	defer p.closeMu.RUnlock()
-
-	// Counted before the wait for the writer slot, so a rollback that arrives
-	// while this blocks knows a begin is pending and leaves a tombstone.
+	// Counted before ANYTHING that can block - the closeMu read lock and the
+	// wait for the writer slot - so a rollback that arrives while this is
+	// blocked knows a begin is pending and leaves a tombstone. Each call runs
+	// in its own goroutine, so even without a compaction the rollback can be
+	// handled before this one reaches the counter.
 	p.mu.Lock()
 	p.begins[id]++
 	p.mu.Unlock()
@@ -319,8 +316,19 @@ func (p *pod) tx(id string) (*bolt.Tx, error) {
 		if p.begins[id] <= 0 {
 			delete(p.begins, id)
 		}
+		// A begin that failed will never register, so a tombstone left for it
+		// would sit in the map forever.
+		if err != nil {
+			delete(p.finished, id)
+		}
 		p.mu.Unlock()
 	}()
+
+	// Held across the begin, like `begin`: a compaction holds closeMu for its
+	// whole run and closes the database, so a transaction that began under it
+	// would be closed out from under the caller.
+	p.closeMu.RLock()
+	defer p.closeMu.RUnlock()
 
 	db, err := p.db(id[:i])
 	if err != nil {
@@ -328,7 +336,7 @@ func (p *pod) tx(id string) (*bolt.Tx, error) {
 	}
 	// Blocks until bbolt's single writer slot is free, so it must not hold
 	// p.mu - the message loop and other operations need it.
-	tx, db, err := p.beginOn(id[:i], db, true)
+	tx, db, err = p.beginOn(id[:i], db, true)
 	if err != nil {
 		return nil, err
 	}
@@ -489,7 +497,9 @@ func (p *pod) begin(args []interface{}, writable bool) (interface{}, error) {
 	}
 	id := p.nextID("tx")
 	p.mu.Lock()
-	p.txs[id] = &txRec{tx: tx, db: db, writable: true}
+	// `writable` as asked, not always true: a read transaction recorded as
+	// writable only works because `finish` also checks `tx.Writable()`.
+	p.txs[id] = &txRec{tx: tx, db: db, writable: writable}
 	p.mu.Unlock()
 	return id, nil
 }
@@ -501,15 +511,23 @@ func (p *pod) finish(args []interface{}, commit bool) (interface{}, error) {
 	// finished - the very hang the tombstone exists to prevent.
 	p.mu.Lock()
 	rec, ok := p.txs[id]
+	pending := p.begins[id] > 0
 	if ok {
 		delete(p.txs, id)
-	} else if p.begins[id] > 0 {
+	} else if pending {
 		// Its first operation is still waiting for the writer slot. Remember
 		// the id, or that begin registers a transaction nobody finishes.
 		p.finished[id] = true
 	}
 	p.mu.Unlock()
 	if !ok {
+		// A commit of an id the pod does not know is not a no-op: the client
+		// believes it committed. It happens when `close` rolls a live
+		// transaction back under its owner, and reporting success there is
+		// silent data loss. A rollback stays idempotent.
+		if commit && !pending {
+			return nil, fmt.Errorf("commit of unknown transaction %q", id)
+		}
 		return nil, nil
 	}
 	tx := rec.tx
@@ -530,9 +548,13 @@ func (p *pod) finish(args []interface{}, commit bool) (interface{}, error) {
 // round-trip and never takes bbolt's writer slot. A transaction id begins the
 // transaction on first use (see tx).
 func (p *pod) withTx(id string, fn func(*bolt.Tx) (interface{}, error)) (interface{}, error) {
-	if tx, err := p.tx(id); err == nil {
+	tx, txErr := p.tx(id)
+	if txErr == nil {
 		return fn(tx)
 	}
+	// Only a handle falls through to a read transaction. Reporting the handle
+	// lookup's error instead of the transaction's hid the real cause behind
+	// "no such handle: db1:N".
 	db, err := p.db(id)
 	if err != nil {
 		return nil, err
@@ -589,7 +611,12 @@ func (p *pod) getMany(args []interface{}) (interface{}, error) {
 		buf = append(buf, '[')
 		n := 0
 		for _, k := range keys {
-			ks, _ := k.(string)
+			ks, ok := k.(string)
+			if !ok {
+				// A nil key would become "" and be skipped, so `fetch` would
+				// silently return fewer documents than it was asked for.
+				return nil, fmt.Errorf("get-many: key %d is not a string: %v", n, k)
+			}
 			v := b.Get([]byte(ks))
 			if v == nil {
 				continue

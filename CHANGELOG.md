@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+## [0.1.3]
+
+- `commit` of an id the pod does not know is an error instead of a silent
+  success. It happens when `close` rolls a live transaction back under its
+  owner, and reporting success there is silent data loss. `rollback` stays
+  idempotent.
+- `get-many` rejects a key that is not a string. A nil key became `""` and was
+  skipped, so the caller silently got fewer documents than it asked for.
+- `withTx` reports the transaction's error instead of the handle lookup's, so
+  a failed begin is no longer hidden behind "no such handle".
+- `begin` records a read transaction as read-only. It was always recorded as
+  writable, which only worked because `finish` also checks `tx.Writable()`.
+- A tombstone is cleared when the begin it was left for fails, instead of
+  sitting in the map forever.
+
 ## [0.1.2]
 
 - A transaction whose first operation was abandoned while it waited for the
