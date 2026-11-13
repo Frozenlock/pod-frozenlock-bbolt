@@ -951,7 +951,8 @@ func getPathsIn(tx *bolt.Tx, bucket string, args []interface{}) (interface{}, er
 	if len(keys) == 0 {
 		return valuePayload(v)
 	}
-	buf, err := appendProjectedJSON(nil, v, keys, projectKeys(keys), true)
+	envB, plainB := projectKeys(keys)
+	buf, err := appendProjectedJSON(nil, v, keys, envB, plainB, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1279,12 +1280,104 @@ func scanJSONObject(v []byte, fn func(key, val []byte)) bool {
 
 // projectKeys precomputes the byte form of the requested keys. Doing it once
 // per scan instead of once per document removes two allocations per document.
-func projectKeys(wants []string) [][]byte {
-	out := make([][]byte, len(wants))
+//
+// Two forms are needed. An envelope stores each field under the key exactly as
+// the adapter encoded it. A plain document is one transit value, where the key
+// is the bare text inside the map - so `["~#'","~:id"]` becomes `~:id` and the
+// JSON string `"id"` becomes `id`.
+func projectKeys(wants []string) (env [][]byte, plain [][]byte) {
+	env = make([][]byte, len(wants))
+	plain = make([][]byte, len(wants))
 	for i, w := range wants {
-		out[i] = []byte(w)
+		env[i] = []byte(w)
+		plain[i] = plainKeyForm([]byte(w))
 	}
-	return out
+	return env, plain
+}
+
+// plainKeyForm turns a key as the adapter encodes it into the form transit
+// uses INSIDE a map. The adapter sends `(encode k)`: a keyword becomes the
+// tagged value ["~#'","~:id"], a string becomes the JSON string "id". Inside
+// a transit map the key is the bare text - "~:id" or "id".
+func plainKeyForm(w []byte) []byte {
+	const tagged = `["~#'","`
+	if len(w) > len(tagged)+2 && bytes.HasPrefix(w, []byte(tagged)) && bytes.HasSuffix(w, []byte(`"]`)) {
+		return w[len(tagged) : len(w)-2]
+	}
+	if len(w) >= 2 && w[0] == '"' && w[len(w)-1] == '"' {
+		return w[1 : len(w)-1]
+	}
+	return w
+}
+
+// scanTransitMap walks a transit :json map, which is the ARRAY
+// ["^ ", k1, v1, k2, v2, ...] - not a JSON object. Keys are JSON strings.
+func scanTransitMap(v []byte, fn func(key, val []byte)) bool {
+	i := skipJSONSpace(v, 0)
+	if i >= len(v) || v[i] != '[' {
+		return false
+	}
+	i = skipJSONSpace(v, i+1)
+	// The "^ " marker that says "this array is a map".
+	if i >= len(v) || v[i] != '"' {
+		return false
+	}
+	markerStart := i + 1
+	i++
+	for i < len(v) && v[i] != '"' {
+		if v[i] == '\\' {
+			i++
+		}
+		i++
+	}
+	if i >= len(v) || string(v[markerStart:i]) != "^ " {
+		return false
+	}
+	i = skipJSONSpace(v, i+1)
+	for {
+		if i >= len(v) {
+			return false
+		}
+		if v[i] == ']' {
+			return true
+		}
+		if v[i] != ',' {
+			return false
+		}
+		i = skipJSONSpace(v, i+1)
+		if i >= len(v) || v[i] != '"' {
+			return false
+		}
+		keyStart := i + 1
+		i++
+		for i < len(v) {
+			switch v[i] {
+			case '\\':
+				i += 2
+			case '"':
+				goto keyDone
+			default:
+				i++
+			}
+		}
+		return false
+	keyDone:
+		key := v[keyStart:i]
+		// Past the closing quote, then the comma that separates the key from
+		// its value - the elements of the array are comma-separated.
+		i = skipJSONSpace(v, i+1)
+		if i >= len(v) || v[i] != ',' {
+			return false
+		}
+		i = skipJSONSpace(v, i+1)
+		valStart := i
+		var ok bool
+		if i, ok = skipJSONValue(v, i); !ok {
+			return false
+		}
+		fn(key, v[valStart:i])
+		i = skipJSONSpace(v, i)
+	}
 }
 
 // projectPlainJSON reduces a plain transit-JSON document to the requested
@@ -1300,14 +1393,16 @@ func projectKeys(wants []string) [][]byte {
 // Each value is copied out as its raw JSON text, which is a complete transit
 // encoding on its own: the writer disables transit's cache, so no value
 // carries a `"^N"` reference into a neighbouring field.
-func projectPlainJSON(dst, v []byte, wantB [][]byte) ([]byte, bool) {
-	if len(v) == 0 || v[0] != '{' {
+func projectPlainJSON(dst, v []byte, wants []string, wantB [][]byte) ([]byte, bool) {
+	// A transit :json map is ["^ ",k,v,...], an ARRAY. This used to require
+	// '{', the :json-verbose shape, so it never fired on a real document.
+	if len(v) == 0 || v[0] != '[' {
 		return dst, false
 	}
 	dst = append(dst, `["fields",[`...)
 	first := true
-	ok := scanJSONObject(v, func(key, val []byte) {
-		for _, w := range wantB {
+	ok := scanTransitMap(v, func(key, val []byte) {
+		for i, w := range wantB {
 			if !bytes.Equal(key, w) {
 				continue
 			}
@@ -1316,7 +1411,10 @@ func projectPlainJSON(dst, v []byte, wantB [][]byte) ([]byte, bool) {
 			}
 			first = false
 			dst = append(dst, '[')
-			dst = appendJSONString(dst, key)
+			// The key as the CALLER encoded it, not the in-map form: the
+			// client decodes it as a transit value, and "~:id" is only valid
+			// inside a map.
+			dst = appendJSONString(dst, []byte(wants[i]))
 			dst = append(dst, ',')
 			dst = appendJSONString(dst, val)
 			dst = append(dst, ']')
@@ -1332,11 +1430,11 @@ func projectPlainJSON(dst, v []byte, wantB [][]byte) ([]byte, bool) {
 // appendProjectedJSON is appendValueJSON reduced to the requested field keys,
 // in the order they were asked for. A missing key is skipped, as projectValue
 // does.
-func appendProjectedJSON(dst, v []byte, wants []string, wantB [][]byte, projectPlain bool) ([]byte, error) {
+func appendProjectedJSON(dst, v []byte, wants []string, wantB, plainB [][]byte, projectPlain bool) ([]byte, error) {
 	fields, body, isEnv := envelopeOf(v)
 	if !isEnv {
 		if projectPlain {
-			if out, ok := projectPlainJSON(dst, v, wantB); ok {
+			if out, ok := projectPlainJSON(dst, v, wants, plainB); ok {
 				return out, nil
 			}
 		}
@@ -1464,7 +1562,7 @@ func scanPathsIn(tx *bolt.Tx, bucket string, args []interface{}) (interface{}, e
 	for i, w := range wants {
 		keys[i], _ = w.(string)
 	}
-	wantB := projectKeys(keys)
+	wantB, plainB := projectKeys(keys)
 	// A plain document is small; projecting it only pays when the caller asked
 	// for specific fields. For a bare `where` the client wants whole documents
 	// anyway, and returning them whole lets it skip the second round-trip.
@@ -1500,7 +1598,7 @@ func scanPathsIn(tx *bolt.Tx, bucket string, args []interface{}) (interface{}, e
 		buf = appendJSONString(buf, k)
 		buf = append(buf, ',')
 		var err error
-		if buf, err = appendProjectedJSON(buf, v, keys, wantB, projectPlain); err != nil {
+		if buf, err = appendProjectedJSON(buf, v, keys, wantB, plainB, projectPlain); err != nil {
 			return nil, err
 		}
 		buf = append(buf, ']')

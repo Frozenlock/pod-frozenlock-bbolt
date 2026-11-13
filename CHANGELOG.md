@@ -16,6 +16,13 @@
   writable, which only worked because `finish` also checks `tx.Writable()`.
 - A tombstone is cleared when the begin it was left for fails, instead of
   sitting in the map forever.
+- `scan-paths` projects a PLAIN document again. `projectPlainJSON` required the
+  value to start with `{`, which is the `:json-verbose` shape; the adapter
+  writes `:json`, where a map is the array `["^ ",k,v,...]`. It never fired, so
+  every `:only`, `fetch-count` and `delete-many!` on a document under 2 KB
+  shipped and decoded the whole thing. The keys are matched in the form transit
+  uses inside a map (`~:id`) and returned in the form the caller sent
+  (`["~#'","~:id"]`), so the client can decode them.
 
 ## [0.1.2]
 

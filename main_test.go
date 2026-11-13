@@ -136,7 +136,8 @@ func TestAppendProjectedJSONMatchesMarshal(t *testing.T) {
 		}
 		want := marshalRef(t, []interface{}{"fields", out})
 
-		got, err := appendProjectedJSON(nil, v, wants, projectKeys(wants), true)
+		envB, plainB := projectKeys(wants)
+		got, err := appendProjectedJSON(nil, v, wants, envB, plainB, true)
 		if err != nil {
 			t.Fatalf("appendProjectedJSON(%v): %v", wants, err)
 		}
@@ -150,12 +151,16 @@ func TestAppendProjectedJSONMatchesMarshal(t *testing.T) {
 // documents are stored as one transit value, and shipping the whole thing to
 // return one field is what made `:only` useless for them.
 func TestAppendProjectedJSONPlainValue(t *testing.T) {
-	v := []byte(`{"~:id":"u1","~:name":"Person 1","~:n":7}`)
-	got, err := appendProjectedJSON(nil, v, []string{"~:id", "~:n", "~:missing"}, projectKeys([]string{"~:id", "~:n", "~:missing"}), true)
+	// A transit :json map is ["^ ",k,v,...]; the adapter sends keys as
+	// (encode k), so a keyword arrives tagged.
+	v := []byte(`["^ ","~:id","u1","~:name","Person 1","~:n",7]`)
+	wants := []string{`["~#'","~:id"]`, `["~#'","~:n"]`, `["~#'","~:missing"]`}
+	envB, plainB := projectKeys(wants)
+	got, err := appendProjectedJSON(nil, v, wants, envB, plainB, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := `["fields",[["~:id","\"u1\""],["~:n","7"]]]`
+	want := `["fields",[["[\"~#'\",\"~:id\"]","\"u1\""],["[\"~#'\",\"~:n\"]","7"]]]`
 	if string(got) != want {
 		t.Errorf("got %s want %s", got, want)
 	}
@@ -178,7 +183,8 @@ func TestAppendProjectedJSONPlainValue(t *testing.T) {
 // whole rather than being dropped.
 func TestAppendProjectedJSONNonObject(t *testing.T) {
 	for _, v := range []string{`"just a string"`, `[1,2,3]`, `not json at all`} {
-		got, err := appendProjectedJSON(nil, []byte(v), []string{"~:id"}, projectKeys([]string{"~:id"}), true)
+		envB, plainB := projectKeys([]string{`["~#'","~:id"]`})
+		got, err := appendProjectedJSON(nil, []byte(v), []string{`["~#'","~:id"]`}, envB, plainB, true)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -206,18 +212,18 @@ func TestAppendJSONStringRoundTrip(t *testing.T) {
 }
 
 func BenchmarkProjectPlainJSON(b *testing.B) {
-	v := []byte(`{"~:id":"u500","~:name":"Person 500","~:email":"p500@x.com","~:age":38,"~:tags":["a","b","c"],"~:address":{"~:street":"500 Main St","~:city":"Springfield","~:zip":"12345"}}`)
-	wantB := projectKeys([]string{"~:id"})
+	v := []byte(`["^ ","~:id","u500","~:name","Person 500","~:email","p500@x.com","~:age",38,"~:tags",["a","b","c"],"~:address",["^ ","~:street","500 Main St","~:city","Springfield","~:zip","12345"]]`)
+	_, plain := projectKeys([]string{`["~#'","~:id"]`})
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		if _, ok := projectPlainJSON(nil, v, wantB); !ok {
+		if _, ok := projectPlainJSON(nil, v, []string{`["~#'","~:id"]`}, plain); !ok {
 			b.Fatal("not projected")
 		}
 	}
 }
 
 func BenchmarkValuePayloadPlain(b *testing.B) {
-	v := []byte(`{"~:id":"u500","~:name":"Person 500","~:email":"p500@x.com","~:age":38,"~:tags":["a","b","c"],"~:address":{"~:street":"500 Main St","~:city":"Springfield","~:zip":"12345"}}`)
+	v := []byte(`["^ ","~:id","u500","~:name","Person 500","~:email","p500@x.com","~:age",38,"~:tags",["a","b","c"],"~:address",["^ ","~:street","500 Main St","~:city","Springfield","~:zip","12345"]]`)
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		if _, err := appendValueJSON(nil, v); err != nil {
@@ -226,80 +232,86 @@ func BenchmarkValuePayloadPlain(b *testing.B) {
 	}
 }
 
-// The hand-rolled scanner must agree with encoding/json on every shape a
+// The hand-rolled scanner must agree with the document on every shape a
 // transit document can take.
+//
+// A transit :json map is the ARRAY ["^ ",k,v,...] - not an object. The adapter
+// sends keys as `(encode k)`, so a keyword arrives as ["~#'","~:id"] while the
+// key INSIDE the map is "~:id". Both forms matter: the first is what the
+// caller asks for, the second is what the document holds.
 func TestProjectPlainJSONMatchesUnmarshal(t *testing.T) {
-	docs := []string{
-		`{}`,
-		`{"~:id":"u1"}`,
-		`{ "~:id" : "u1" , "~:n" : 7 }`,
-		`{"~:id":"u1","~:tags":["a","b"],"~:address":{"~:city":"S","~:zip":"1"}}`,
-		`{"~:s":"has \"quotes\" and \\ backslash"}`,
-		`{"~:s":"brace } and comma , inside"}`,
-		`{"~:s":"[not an array]"}`,
-		`{"~:n":-1.5e10,"~:b":true,"~:z":null}`,
-		`{"~:empty":{},"~:earr":[]}`,
-		`{"~:deep":{"a":{"b":{"c":[1,{"d":"}"}]}}}}`,
-		`{"~:unicode":"héllo 世界 🎉"}`,
-		`{"~:a":1,"~:a":2}`,
+	docs := []struct {
+		transit string
+		want    map[string]string // caller's key form -> the raw JSON text
+	}{
+		{`["^ "]`, map[string]string{}},
+		{`["^ ","~:id","u1"]`, map[string]string{`["~#'","~:id"]`: `"u1"`}},
+		{`["^ ","~:id","u1","~:n",7]`, map[string]string{`["~#'","~:id"]`: `"u1"`, `["~#'","~:n"]`: `7`}},
+		{`["^ ","~:id","u1","~:tags",["a","b"],"~:address",["^ ","~:city","S","~:zip","1"]]`,
+			map[string]string{
+				`["~#'","~:id"]`:      `"u1"`,
+				`["~#'","~:tags"]`:    `["a","b"]`,
+				`["~#'","~:address"]`: `["^ ","~:city","S","~:zip","1"]`,
+			}},
+		{`["^ ","~:s","has \"quotes\" and \\ backslash"]`,
+			map[string]string{`["~#'","~:s"]`: `"has \"quotes\" and \\ backslash"`}},
+		{`["^ ","~:s","brace } and comma , inside"]`,
+			map[string]string{`["~#'","~:s"]`: `"brace } and comma , inside"`}},
+		{`["^ ","~:s","[not an array]"]`, map[string]string{`["~#'","~:s"]`: `"[not an array]"`}},
+		{`["^ ","~:n",-1.5e10,"~:b",true,"~:z",null]`,
+			map[string]string{`["~#'","~:n"]`: `-1.5e10`, `["~#'","~:b"]`: `true`, `["~#'","~:z"]`: `null`}},
+		{`["^ ","~:empty",["^ "],"~:earr",[]]`,
+			map[string]string{`["~#'","~:empty"]`: `["^ "]`, `["~#'","~:earr"]`: `[]`}},
+		{`["^ ","~:deep",["^ ","a",["^ ","b",["^ ","c",[1,["^ ","d","}"]]]]]]`,
+			map[string]string{`["~#'","~:deep"]`: `["^ ","a",["^ ","b",["^ ","c",[1,["^ ","d","}"]]]]]`}},
+		{`["^ ","~:unicode","héllo 世界 🎉"]`,
+			map[string]string{`["~#'","~:unicode"]`: `"héllo 世界 🎉"`}},
+		// A string key: the adapter sends the JSON string, the map holds the
+		// bare text.
+		{`["^ ","id","u1","~:n",7]`, map[string]string{`"id"`: `"u1"`, `["~#'","~:n"]`: `7`}},
 	}
-	wants := []string{"~:id", "~:n", "~:s", "~:tags", "~:address", "~:deep", "~:unicode", "~:a", "~:missing"}
-	for _, doc := range docs {
-		got, ok := projectPlainJSON(nil, []byte(doc), projectKeys(wants))
+	wants := []string{
+		`["~#'","~:id"]`, `["~#'","~:n"]`, `["~#'","~:s"]`, `["~#'","~:tags"]`,
+		`["~#'","~:address"]`, `["~#'","~:empty"]`, `["~#'","~:earr"]`,
+		`["~#'","~:unicode"]`, `["~#'","~:b"]`, `["~#'","~:z"]`,
+		`["~#'","~:deep"]`, `["~#'","~:missing"]`, `"id"`,
+	}
+	_, plain := projectKeys(wants)
+	wanted := map[string]bool{}
+	for _, w := range wants {
+		wanted[w] = true
+	}
+	for _, d := range docs {
+		got, ok := projectPlainJSON(nil, []byte(d.transit), wants, plain)
 		if !ok {
-			t.Fatalf("%s: not projected", doc)
+			t.Fatalf("%s: not projected", d.transit)
 		}
-		// Reference: what json.Unmarshal into a map would have produced.
-		var obj map[string]json.RawMessage
-		if err := json.Unmarshal([]byte(doc), &obj); err != nil {
-			t.Fatalf("%s: %v", doc, err)
+		var parsed []interface{}
+		if err := json.Unmarshal(got, &parsed); err != nil {
+			t.Fatalf("%s: output not JSON: %v (%s)", d.transit, err, got)
 		}
-		var gotParsed []interface{}
-		if err := json.Unmarshal(got, &gotParsed); err != nil {
-			t.Fatalf("%s: output not JSON: %v (%s)", doc, err, got)
-		}
-		fields := gotParsed[1].([]interface{})
 		seen := map[string]string{}
-		for _, f := range fields {
+		for _, f := range parsed[1].([]interface{}) {
 			pair := f.([]interface{})
 			seen[pair[0].(string)] = pair[1].(string)
 		}
-		for k, raw := range obj {
-			if _, wanted := seen[k]; !wanted {
-				continue
-			}
-			var a, b interface{}
-			if err := json.Unmarshal([]byte(seen[k]), &a); err != nil {
-				t.Errorf("%s: key %s blob not JSON: %v", doc, k, err)
-				continue
-			}
-			if err := json.Unmarshal(raw, &b); err != nil {
-				t.Fatal(err)
-			}
-			if !reflect.DeepEqual(a, b) {
-				t.Errorf("%s: key %s got %v want %v", doc, k, a, b)
+		// Exactly the wanted keys the document has, with their exact text.
+		expect := map[string]string{}
+		for k, v := range d.want {
+			if wanted[k] {
+				expect[k] = v
 			}
 		}
-		// Every wanted key present in the document must appear.
-		for k := range obj {
-			found := false
-			for _, w := range wants {
-				if w == k {
-					found = true
-				}
-			}
-			if found {
-				if _, ok := seen[k]; !ok {
-					t.Errorf("%s: key %s missing from projection", doc, k)
-				}
-			}
+		if !reflect.DeepEqual(seen, expect) {
+			t.Errorf("%s:\n got %v\nwant %v", d.transit, seen, expect)
 		}
 	}
 }
 
 func TestProjectPlainJSONRejectsNonObjects(t *testing.T) {
-	for _, v := range []string{``, `[]`, `"s"`, `7`, `null`, `{`, `{"a"}`, `{"a":}`, `{"a":1,}`} {
-		if _, ok := projectPlainJSON(nil, []byte(v), projectKeys([]string{"a"})); ok {
+	for _, v := range []string{``, `[]`, `"s"`, `7`, `null`, `[`, `["^ "`, `["^ ","a"]`, `["^ ","a",]`} {
+		_, plain := projectKeys([]string{"a"})
+		if _, ok := projectPlainJSON(nil, []byte(v), []string{"a"}, plain); ok {
 			t.Errorf("%q: expected rejection", v)
 		}
 	}
