@@ -30,7 +30,7 @@ const ns = "pod.frozenlock.bbolt"
 // version is the pod's own version, reported by the `version` var so a client
 // can check what it is talking to at run time. It is kept in step with the git
 // tag and the pod-registry manifest by the release script.
-const version = "0.1.1"
+const version = "0.1.2"
 
 // Bulk-load page fill. bbolt splits a page when it is half full by default,
 // which for a sequential load means every page is written twice and the file
@@ -77,15 +77,23 @@ type pod struct {
 	paths   map[string]*dbRef
 	openMu  map[string]*sync.Mutex
 	txs     map[string]*txRec
-	seq     int64
+	// finished remembers transaction ids that were finished before they
+	// began. A transaction begins lazily, on its first operation, and that
+	// operation blocks until bbolt's writer slot is free; a client that gives
+	// up while it waits sends its rollback first. Without this the pod would
+	// then begin the transaction and register it, and nobody would ever
+	// finish it - taking the writer slot for good.
+	finished map[string]bool
+	seq      int64
 }
 
 func newPod() *pod {
 	return &pod{
-		dbs:    map[string]*bolt.DB{},
-		paths:  map[string]*dbRef{},
-		openMu: map[string]*sync.Mutex{},
-		txs:    map[string]*txRec{},
+		dbs:      map[string]*bolt.DB{},
+		paths:    map[string]*dbRef{},
+		openMu:   map[string]*sync.Mutex{},
+		txs:      map[string]*txRec{},
+		finished: map[string]bool{},
 	}
 }
 
@@ -288,6 +296,13 @@ func (p *pod) tx(id string) (*bolt.Tx, error) {
 	if i < 0 {
 		return nil, fmt.Errorf("no such transaction: %s", id)
 	}
+
+	// Held across the begin, like `begin`: a compaction holds closeMu for its
+	// whole run and closes the database, so a transaction that began under it
+	// would be closed out from under the caller.
+	p.closeMu.RLock()
+	defer p.closeMu.RUnlock()
+
 	db, err := p.db(id[:i])
 	if err != nil {
 		return nil, err
@@ -299,6 +314,14 @@ func (p *pod) tx(id string) (*bolt.Tx, error) {
 		return nil, err
 	}
 	p.mu.Lock()
+	// The client gave up while this waited for the slot and sent its rollback
+	// first. Registering now would leave a transaction nobody finishes.
+	if p.finished[id] {
+		delete(p.finished, id)
+		p.mu.Unlock()
+		_ = tx.Rollback()
+		return nil, fmt.Errorf("transaction %s was finished before it began", id)
+	}
 	// Another operation may have begun it while we waited for the slot.
 	if rec, ok := p.txs[id]; ok {
 		p.mu.Unlock()
@@ -309,6 +332,11 @@ func (p *pod) tx(id string) (*bolt.Tx, error) {
 	p.mu.Unlock()
 	return tx, nil
 }
+
+// finishedMax bounds the tombstone set. A tombstone only matters while the
+// begin it races is still waiting for the writer slot, so dropping old ones is
+// safe.
+const finishedMax = 4096
 
 // rollbackFor rolls back every open transaction belonging to `db`. Caller
 // holds p.mu.
@@ -460,6 +488,16 @@ func (p *pod) finish(args []interface{}, commit bool) (interface{}, error) {
 	p.mu.Unlock()
 	if !ok {
 		// A transaction that ran no operation never began; nothing to finish.
+		// Leave a tombstone: its first operation may still be waiting for the
+		// writer slot, and would otherwise register a transaction nobody
+		// finishes. Bounded - a lost tombstone only means the old hang can
+		// recur, never a wrong answer.
+		p.mu.Lock()
+		if len(p.finished) >= finishedMax {
+			p.finished = map[string]bool{}
+		}
+		p.finished[id] = true
+		p.mu.Unlock()
 		return nil, nil
 	}
 	tx := rec.tx

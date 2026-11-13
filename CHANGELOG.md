@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+## [0.1.2]
+
+- A transaction whose first operation was abandoned while it waited for the
+  writer slot no longer orphans itself. The transaction begins lazily, so the
+  client's rollback could arrive before the pod had registered it; the pod
+  then registered it anyway and nobody ever finished it, taking bbolt's single
+  writer slot for good. `finish` on an unknown id now leaves a tombstone that
+  the pending begin checks.
+- `tx` holds `closeMu` across the begin, like `begin`. A compaction holds it
+  for its whole run and closes the database, so a transaction that began under
+  it could be closed out from under the caller.
+
 ## [0.1.1]
 
 - A transaction that only reads commits as a rollback instead of a commit, so

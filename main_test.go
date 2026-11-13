@@ -465,3 +465,44 @@ func TestCompactionKeepsConcurrentWrites(t *testing.T) {
 		t.Fatal("a write committed during compaction was lost")
 	}
 }
+
+func TestFinishBeforeBeginLeavesNoTransaction(t *testing.T) {
+	dir := t.TempDir()
+	p := newPod()
+	h, err := p.open([]interface{}{dir + "/tombstone.db"})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _, _ = p.close([]interface{}{h}) }()
+
+	// A client that gives up while its first operation waits for the writer
+	// slot sends its rollback before the pod has registered the transaction.
+	id := fmt.Sprintf("%s:1", h)
+	if _, err := p.finish([]interface{}{id}, false); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	// The pending begin must not register it: a transaction nobody finishes
+	// takes bbolt's single writer slot for good.
+	if _, err := p.tx(id); err == nil {
+		t.Fatal("tx on a finished-before-begin id should fail")
+	}
+	p.mu.Lock()
+	_, registered := p.txs[id]
+	p.mu.Unlock()
+	if registered {
+		t.Fatal("the transaction was registered after being finished")
+	}
+
+	// And the writer slot is free: a real transaction still works.
+	tx, err := p.begin([]interface{}{h}, true)
+	if err != nil {
+		t.Fatalf("begin after the tombstone: %v", err)
+	}
+	if _, err := p.put([]interface{}{tx, "b", "k", "v"}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if _, err := p.finish([]interface{}{tx}, true); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+}
