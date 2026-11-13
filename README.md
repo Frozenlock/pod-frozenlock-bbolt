@@ -85,12 +85,16 @@ plain transit document or an envelope whose fields are stored separately:
 | `"doc"` | the stored string | a plain (small) document, whole |
 | `"fields"` | `[[field-key blob] ...]` | an envelope, one entry per stored field |
 | `"field"` | one blob | `get-path` found the requested field |
-| `"missing"` | `""` | `get-path` found no such field or document |
+| `"missing"` | `""` | `get-path` found no such field |
+| `"nodoc"` | `""` | `get-path` found no such document |
 
 `get` and `get-many` return `"doc"` or `"fields"`; `get-path` returns
-`"field"`, `"doc"` or `"missing"`. Each blob is a complete transit value on
-its own — the writer disables transit's cache, so a blob never refers to
-another field's encoding.
+`"field"`, `"doc"`, `"missing"` or `"nodoc"`. `"missing"` and `"nodoc"` are
+kept apart because they call for different fallbacks: a missing field still
+has a document to read, a missing document does not.
+
+Each blob is a complete transit value on its own — the writer disables
+transit's cache, so a blob never refers to another field's encoding.
 
 `get-paths` and `scan-paths` project instead: they return the same
 `[kind payload]` shape for an envelope, but a plain document comes back as a

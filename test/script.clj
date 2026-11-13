@@ -431,8 +431,10 @@
                        (is (= {:city "Springfield"} (dec* blob)))))
                    (testing "a field that is not stored"
                      (is (= ["missing" ""] (b/get-path tx "b" "big" (enc :nope)))))
-                   (testing "a missing document"
-                     (is (= ["missing" ""] (b/get-path tx "b" "nope" (enc :id)))))))))))
+                   (testing "a missing document is distinct from a missing field"
+                     ;; The adapter needs to tell them apart: a missing field
+                     ;; still has a document to fall back to.
+                     (is (= ["nodoc" ""] (b/get-path tx "b" "nope" (enc :id)))))))))))
 
 (deftest put-field-updates-one-field
   (with-db

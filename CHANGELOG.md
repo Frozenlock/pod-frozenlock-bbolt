@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+## [0.1.1]
+
+- A transaction that only reads commits as a rollback instead of a commit, so
+  it skips the fsync. `finish` now checks the transaction was begun writable
+  as well as dirty.
+- `get-path` answers `["nodoc" ""]` for an absent document, distinct from
+  `["missing" ""]` for a document that has no such field. The adapter needs the
+  difference: a missing field still has a document to fall back to.
+
 ## [0.1.0]
 
 First release.

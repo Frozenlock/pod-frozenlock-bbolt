@@ -30,7 +30,7 @@ const ns = "pod.frozenlock.bbolt"
 // version is the pod's own version, reported by the `version` var so a client
 // can check what it is talking to at run time. It is kept in step with the git
 // tag and the pod-registry manifest by the release script.
-const version = "0.1.0"
+const version = "0.1.1"
 
 // Bulk-load page fill. bbolt splits a page when it is half full by default,
 // which for a sequential load means every page is written twice and the file
@@ -52,9 +52,10 @@ var vars = []string{
 // txRec keeps the owning DB with the transaction so `close` can roll back the
 // transactions of the DB it is about to close (bbolt's Close waits for them).
 type txRec struct {
-	tx    *bolt.Tx
-	db    *bolt.DB
-	dirty bool // any write happened; a clean tx commits as a rollback
+	tx       *bolt.Tx
+	db       *bolt.DB
+	writable bool // began as a write transaction (or upgraded to one)
+	dirty    bool // any write happened; a clean tx commits as a rollback
 }
 
 // dbRef is one open file, shared by every handle that names it. bbolt
@@ -269,6 +270,12 @@ func (p *pod) db(handle string) (*bolt.DB, error) {
 // instead would cost an extra round-trip; beginning lazily on the client side
 // would leave the first read outside the transaction and open a lost-update
 // window against concurrent writers.
+//
+// It is always a WRITE transaction, even when the transaction only reads: a
+// read transaction cannot be upgraded in place, and dropping its snapshot to
+// begin a write one would let two read-modify-write transactions read the same
+// value and lose an update. Reads that are not in a transaction go through
+// `withTx`, which uses `db.View` and so never takes the writer slot.
 func (p *pod) tx(id string) (*bolt.Tx, error) {
 	p.mu.Lock()
 	rec, ok := p.txs[id]
@@ -298,7 +305,7 @@ func (p *pod) tx(id string) (*bolt.Tx, error) {
 		_ = tx.Rollback()
 		return rec.tx, nil
 	}
-	p.txs[id] = &txRec{tx: tx, db: db}
+	p.txs[id] = &txRec{tx: tx, db: db, writable: true}
 	p.mu.Unlock()
 	return tx, nil
 }
@@ -440,7 +447,7 @@ func (p *pod) begin(args []interface{}, writable bool) (interface{}, error) {
 	}
 	id := p.nextID("tx")
 	p.mu.Lock()
-	p.txs[id] = &txRec{tx: tx, db: db}
+	p.txs[id] = &txRec{tx: tx, db: db, writable: true}
 	p.mu.Unlock()
 	return id, nil
 }
@@ -460,7 +467,7 @@ func (p *pod) finish(args []interface{}, commit bool) (interface{}, error) {
 	// fsyncs, and there is nothing to make durable. Deciding here (rather than
 	// in the client) means a write method that forgets to flag itself can't
 	// silently lose data.
-	if commit && rec.dirty && tx.Writable() {
+	if commit && rec.writable && rec.dirty && tx.Writable() {
 		return nil, tx.Commit()
 	}
 	return nil, tx.Rollback()
@@ -799,7 +806,8 @@ func (p *pod) putField(args []interface{}) (interface{}, error) {
 //	args: tx bucket key field-key
 //
 // Returns [kind blob] where kind is "field" (envelope hit), "doc" (the value
-// is not an envelope, so the whole document came back) or "missing".
+// is not an envelope, so the whole document came back), "missing" (the
+// document exists but has no such field) or "nodoc" (no such document).
 func (p *pod) getPath(args []interface{}) (interface{}, error) {
 	bucket := str(args, 1)
 	return p.withTx(str(args, 0), func(tx *bolt.Tx) (interface{}, error) {
@@ -810,11 +818,11 @@ func (p *pod) getPath(args []interface{}) (interface{}, error) {
 func getPathIn(tx *bolt.Tx, bucket string, args []interface{}) (interface{}, error) {
 	b := tx.Bucket([]byte(bucket))
 	if b == nil {
-		return []interface{}{"missing", ""}, nil
+		return []interface{}{"nodoc", ""}, nil
 	}
 	v := b.Get([]byte(str(args, 2)))
 	if v == nil {
-		return []interface{}{"missing", ""}, nil
+		return []interface{}{"nodoc", ""}, nil
 	}
 	fields, body, ok := envelopeOf(v)
 	if !ok {
