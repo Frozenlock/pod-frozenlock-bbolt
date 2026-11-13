@@ -13,6 +13,14 @@
 - `tx` holds `closeMu` across the begin, like `begin`. A compaction holds it
   for its whole run and closes the database, so a transaction that began under
   it could be closed out from under the caller.
+- `finish` looks the id up and leaves its tombstone under one lock. In two
+  critical sections a begin could register in between and never be finished -
+  the same orphan, in a narrower window.
+- A tombstone is only left when a begin is actually pending. Before, every
+  transaction that never touched the pod - `(transact! d identity)`, an empty
+  `upsert-many!`, an `f` that throws before its first operation - left one
+  behind forever, and the set was cleared wholesale at 4096, which could drop
+  the one that mattered.
 
 ## [0.1.1]
 
