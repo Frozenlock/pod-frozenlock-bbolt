@@ -84,7 +84,11 @@ type pod struct {
 	// then begin the transaction and register it, and nobody would ever
 	// finish it - taking the writer slot for good.
 	finished map[string]bool
-	seq      int64
+	// begins counts in-flight lazy begins per transaction id. A tombstone is
+	// only worth leaving while one is pending - otherwise every transaction
+	// that never touched the pod would leave one behind forever.
+	begins map[string]int
+	seq    int64
 }
 
 func newPod() *pod {
@@ -94,6 +98,7 @@ func newPod() *pod {
 		openMu:   map[string]*sync.Mutex{},
 		txs:      map[string]*txRec{},
 		finished: map[string]bool{},
+		begins:   map[string]int{},
 	}
 }
 
@@ -303,6 +308,20 @@ func (p *pod) tx(id string) (*bolt.Tx, error) {
 	p.closeMu.RLock()
 	defer p.closeMu.RUnlock()
 
+	// Counted before the wait for the writer slot, so a rollback that arrives
+	// while this blocks knows a begin is pending and leaves a tombstone.
+	p.mu.Lock()
+	p.begins[id]++
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		p.begins[id]--
+		if p.begins[id] <= 0 {
+			delete(p.begins, id)
+		}
+		p.mu.Unlock()
+	}()
+
 	db, err := p.db(id[:i])
 	if err != nil {
 		return nil, err
@@ -332,11 +351,6 @@ func (p *pod) tx(id string) (*bolt.Tx, error) {
 	p.mu.Unlock()
 	return tx, nil
 }
-
-// finishedMax bounds the tombstone set. A tombstone only matters while the
-// begin it races is still waiting for the writer slot, so dropping old ones is
-// safe.
-const finishedMax = 4096
 
 // rollbackFor rolls back every open transaction belonging to `db`. Caller
 // holds p.mu.
@@ -482,22 +496,20 @@ func (p *pod) begin(args []interface{}, writable bool) (interface{}, error) {
 
 func (p *pod) finish(args []interface{}, commit bool) (interface{}, error) {
 	id := str(args, 0)
+	// One critical section: looking the id up and leaving the tombstone must
+	// not be separable, or a begin that registers in between is never
+	// finished - the very hang the tombstone exists to prevent.
 	p.mu.Lock()
 	rec, ok := p.txs[id]
-	delete(p.txs, id)
+	if ok {
+		delete(p.txs, id)
+	} else if p.begins[id] > 0 {
+		// Its first operation is still waiting for the writer slot. Remember
+		// the id, or that begin registers a transaction nobody finishes.
+		p.finished[id] = true
+	}
 	p.mu.Unlock()
 	if !ok {
-		// A transaction that ran no operation never began; nothing to finish.
-		// Leave a tombstone: its first operation may still be waiting for the
-		// writer slot, and would otherwise register a transaction nobody
-		// finishes. Bounded - a lost tombstone only means the old hang can
-		// recur, never a wrong answer.
-		p.mu.Lock()
-		if len(p.finished) >= finishedMax {
-			p.finished = map[string]bool{}
-		}
-		p.finished[id] = true
-		p.mu.Unlock()
 		return nil, nil
 	}
 	tx := rec.tx

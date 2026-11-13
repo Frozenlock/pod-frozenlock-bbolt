@@ -475,16 +475,46 @@ func TestFinishBeforeBeginLeavesNoTransaction(t *testing.T) {
 	}
 	defer func() { _, _ = p.close([]interface{}{h}) }()
 
-	// A client that gives up while its first operation waits for the writer
-	// slot sends its rollback before the pod has registered the transaction.
+	// Hold the writer slot so the lazy begin below blocks in the pod.
+	blocker, err := p.begin([]interface{}{h}, true)
+	if err != nil {
+		t.Fatalf("begin blocker: %v", err)
+	}
+
 	id := fmt.Sprintf("%s:1", h)
+	done := make(chan error, 1)
+	go func() {
+		_, err := p.tx(id)
+		done <- err
+	}()
+
+	// Wait until the begin is counted as pending.
+	pending := false
+	for i := 0; i < 2000; i++ {
+		p.mu.Lock()
+		n := p.begins[id]
+		p.mu.Unlock()
+		if n > 0 {
+			pending = true
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !pending {
+		t.Fatal("the begin never became pending")
+	}
+
+	// The client gives up while its first operation waits.
 	if _, err := p.finish([]interface{}{id}, false); err != nil {
 		t.Fatalf("rollback: %v", err)
 	}
 
-	// The pending begin must not register it: a transaction nobody finishes
-	// takes bbolt's single writer slot for good.
-	if _, err := p.tx(id); err == nil {
+	// Free the slot: the begin must not register a transaction nobody
+	// finishes, which would take bbolt's single writer slot for good.
+	if _, err := p.finish([]interface{}{blocker}, true); err != nil {
+		t.Fatalf("commit blocker: %v", err)
+	}
+	if err := <-done; err == nil {
 		t.Fatal("tx on a finished-before-begin id should fail")
 	}
 	p.mu.Lock()
